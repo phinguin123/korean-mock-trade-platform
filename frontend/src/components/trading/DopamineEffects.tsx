@@ -3,32 +3,40 @@
 import { AnimatePresence, motion } from 'framer-motion';
 import { useEffect, useRef } from 'react';
 import { useMarketData } from '@/hooks/useMarketData';
+import { formatSignedWon } from '@/lib/format';
 import type { DopamineEvent } from '@/types/trading';
 
 // ---------------------------------------------------------------------------
-// Web Audio synth — no external audio files. A tiny oscillator + gain
-// envelope stack that fakes a "cash register" chime (profit / long) or a
-// dull thud (loss / short) purely from synthesized frequencies.
+// Tiny Web Audio synth — soft chime on positive events, muted thud otherwise.
 // ---------------------------------------------------------------------------
 
-let sharedAudioCtx: AudioContext | null = null;
+let sharedCtx: AudioContext | null = null;
 
-function getAudioContext(): AudioContext | null {
+function getCtx(): AudioContext | null {
   if (typeof window === 'undefined') return null;
-  const Ctor = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  const Ctor =
+    window.AudioContext ??
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
   if (!Ctor) return null;
-  if (!sharedAudioCtx) sharedAudioCtx = new Ctor();
-  if (sharedAudioCtx.state === 'suspended') void sharedAudioCtx.resume();
-  return sharedAudioCtx;
+  if (!sharedCtx) sharedCtx = new Ctor();
+  if (sharedCtx.state === 'suspended') void sharedCtx.resume();
+  return sharedCtx;
 }
 
-function playTone(ctx: AudioContext, freq: number, startAt: number, duration: number, type: OscillatorType, peakGain: number) {
+function tone(
+  ctx: AudioContext,
+  freq: number,
+  startAt: number,
+  duration: number,
+  type: OscillatorType,
+  peak: number,
+) {
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
   osc.type = type;
   osc.frequency.setValueAtTime(freq, startAt);
   gain.gain.setValueAtTime(0.0001, startAt);
-  gain.gain.exponentialRampToValueAtTime(peakGain, startAt + 0.015);
+  gain.gain.exponentialRampToValueAtTime(peak, startAt + 0.015);
   gain.gain.exponentialRampToValueAtTime(0.0001, startAt + duration);
   osc.connect(gain);
   gain.connect(ctx.destination);
@@ -36,91 +44,68 @@ function playTone(ctx: AudioContext, freq: number, startAt: number, duration: nu
   osc.stop(startAt + duration + 0.02);
 }
 
-/** Bright ascending arpeggio — profit realized or a long entry filled. */
-function playProfitChime(ctx: AudioContext) {
-  const now = ctx.currentTime;
-  const notes = [880, 1108.73, 1318.51]; // A5, C#6, E6 — major chime
-  notes.forEach((freq, i) => playTone(ctx, freq, now + i * 0.07, 0.22, 'triangle', 0.18));
-}
-
-/** Low descending thud — loss realized or a short entry filled. */
-function playLossThud(ctx: AudioContext) {
-  const now = ctx.currentTime;
-  playTone(ctx, 220, now, 0.28, 'sawtooth', 0.16);
-  playTone(ctx, 164.81, now + 0.05, 0.32, 'sine', 0.14);
-}
-
-function playForKind(kind: DopamineEvent['kind']) {
-  const ctx = getAudioContext();
+function play(kind: DopamineEvent['kind']) {
+  const ctx = getCtx();
   if (!ctx) return;
-  if (kind === 'profit' || kind === 'long') playProfitChime(ctx);
-  else playLossThud(ctx);
+  const now = ctx.currentTime;
+  if (kind === 'profit' || kind === 'long') {
+    [880, 1108.73, 1318.51].forEach((f, i) => tone(ctx, f, now + i * 0.06, 0.2, 'triangle', 0.12));
+  } else {
+    tone(ctx, 240, now, 0.24, 'sine', 0.1);
+    tone(ctx, 170, now + 0.05, 0.28, 'sine', 0.09);
+  }
 }
 
-// ---------------------------------------------------------------------------
-// Visuals
-// ---------------------------------------------------------------------------
+const DISMISS_MS = 1500;
 
-function formatSigned(amount: number): string {
-  const rounded = Math.round(amount);
-  const sign = rounded >= 0 ? '+' : '-';
-  return `${sign}₩${Math.abs(rounded).toLocaleString('ko-KR')}`;
-}
-
-const AUTO_DISMISS_MS = 1400;
-
-function Particle({ event, onDone }: { event: DopamineEvent; onDone: (id: string) => void }) {
-  const isPositive = event.kind === 'profit' || event.kind === 'long';
+function Bubble({ event, onDone }: { event: DopamineEvent; onDone: (id: string) => void }) {
+  const positive = event.kind === 'profit' || event.kind === 'long';
 
   useEffect(() => {
-    const t = setTimeout(() => onDone(event.id), AUTO_DISMISS_MS);
+    const t = setTimeout(() => onDone(event.id), DISMISS_MS);
     return () => clearTimeout(t);
   }, [event.id, onDone]);
 
   return (
     <motion.div
-      initial={{ opacity: 0, y: 8, scale: 0.85 }}
-      animate={{ opacity: 1, y: isPositive ? -64 : 48, scale: 1 }}
-      exit={{ opacity: 0, y: isPositive ? -88 : 72, scale: 0.9 }}
-      transition={{ duration: AUTO_DISMISS_MS / 1000, ease: 'easeOut' }}
-      className="pointer-events-none absolute left-1/2 top-1/2 flex -translate-x-1/2 -translate-y-1/2 flex-col items-center"
+      layout
+      initial={{ opacity: 0, y: 24, scale: 0.94 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, y: -12, scale: 0.96 }}
+      transition={{ duration: 0.45, ease: [0.22, 1, 0.36, 1] }}
+      className="pointer-events-none flex flex-col items-center gap-1 rounded-2xl bg-card px-5 py-3 shadow-toss-lg"
     >
-      <span
-        className={`whitespace-nowrap rounded-full px-3 py-1 font-mono text-lg font-extrabold drop-shadow-lg ${
-          isPositive ? 'text-emerald-400' : 'text-rose-400'
-        }`}
-        style={{ textShadow: '0 2px 12px rgba(0,0,0,0.6)' }}
-      >
-        {formatSigned(event.amount)}
-      </span>
-      <span className="text-[10px] font-semibold uppercase tracking-wider text-slate-300/80">{event.label}</span>
+      {event.amount !== 0 && (
+        <span
+          className={`text-[22px] font-bold tabular-nums ${positive ? 'text-up' : 'text-down'}`}
+        >
+          {formatSignedWon(event.amount)}
+        </span>
+      )}
+      <span className="text-[13px] font-semibold text-secondary-foreground">{event.label}</span>
     </motion.div>
   );
 }
 
-/**
- * Overlay of floating PnL particles anchored over the order panel, plus the
- * synthesized audio trigger. Mount once, absolutely positioned inside a
- * `relative` wrapper around <OrderPanel />.
- */
+/** Floating feedback toasts, centered over the trade panel. */
 export function DopamineEffects() {
   const effects = useMarketData((s) => s.effects);
   const dismissEffect = useMarketData((s) => s.dismissEffect);
-  const playedIds = useRef(new Set<string>());
+  const played = useRef(new Set<string>());
 
   useEffect(() => {
     for (const effect of effects) {
-      if (playedIds.current.has(effect.id)) continue;
-      playedIds.current.add(effect.id);
-      playForKind(effect.kind);
+      if (played.current.has(effect.id)) continue;
+      played.current.add(effect.id);
+      play(effect.kind);
     }
   }, [effects]);
 
   return (
-    <div className="pointer-events-none absolute inset-0 z-20 overflow-visible">
+    <div className="pointer-events-none fixed inset-x-0 bottom-8 z-50 flex flex-col items-center gap-2 px-5">
       <AnimatePresence>
         {effects.map((event) => (
-          <Particle key={event.id} event={event} onDone={dismissEffect} />
+          <Bubble key={event.id} event={event} onDone={dismissEffect} />
         ))}
       </AnimatePresence>
     </div>

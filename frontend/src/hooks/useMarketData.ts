@@ -1,353 +1,312 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useRef } from 'react';
 import { create } from 'zustand';
 import type {
-  ClientMessage,
   ConnectionStatus,
   DopamineEvent,
   Leverage,
-  OrderType,
+  MarketSnapshot,
+  OrderBookLevel,
+  OrderBookSnapshot,
   Portfolio,
-  ServerMessage,
-  SymbolMarketState,
-  TickDirection,
-  TradeSide,
+  Position,
+  Side,
+  Tick,
 } from '@/types/trading';
 
 // ---------------------------------------------------------------------------
-// Config
+// Local mock market simulator. UI-only: nothing is routed anywhere.
 // ---------------------------------------------------------------------------
 
-const WS_URL = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8080';
-const DEFAULT_SYMBOL = process.env.NEXT_PUBLIC_DEFAULT_SYMBOL ?? '005930';
+const SYMBOL = '005930';
+const NAME = 'Samsung Electronics';
+const TICK_SIZE = 100;
+const BASE_PRICE = 74_800;
+const PREV_CLOSE = 73_900;
+const DEPTH = 9;
+const STARTING_BALANCE = 10_000_000;
+const HISTORY = 90;
 
-const PING_INTERVAL_MS = 10_000;
-const FLASH_RESET_MS = 150; // spec: flash resets after 150ms
-const BASE_RECONNECT_DELAY_MS = 500;
-const MAX_RECONNECT_DELAY_MS = 10_000;
+let tickSeq = 0;
+let idSeq = 0;
+const uid = (prefix: string) => `${prefix}-${++idSeq}`;
 
-// ---------------------------------------------------------------------------
-// Module-level (non-reactive) connection handles.
-//
-// The socket, timers and reconnect counters intentionally live OUTSIDE the
-// Zustand store so that scheduling a ping or a reconnect never itself
-// triggers a re-render — only the pieces of state consumers actually read
-// (price, book, portfolio, flash direction, ...) flow through `set()`.
-// ---------------------------------------------------------------------------
+function randomVolume(distance: number): number {
+  const base = 1_800 + Math.random() * 9_000;
+  return Math.round(base * (1 + distance * 0.35));
+}
 
-let socket: WebSocket | null = null;
-let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-let pingTimer: ReturnType<typeof setInterval> | null = null;
-let flashTimer: ReturnType<typeof setTimeout> | null = null;
-let reconnectAttempts = 0;
-let pingSentAt = 0;
-let manuallyClosed = false;
-let refCount = 0;
+function buildOrderBook(price: number): OrderBookSnapshot {
+  const mid = Math.round(price / TICK_SIZE) * TICK_SIZE;
+  const asks: OrderBookLevel[] = [];
+  const bids: OrderBookLevel[] = [];
+  for (let i = 0; i < DEPTH; i++) {
+    asks.push({ price: mid + TICK_SIZE * (i + 1), volume: randomVolume(i) });
+    bids.push({ price: mid - TICK_SIZE * i, volume: randomVolume(i) });
+  }
+  return { asks, bids };
+}
 
-// ---------------------------------------------------------------------------
-// Store shape
-// ---------------------------------------------------------------------------
+function nextPrice(price: number): { price: number; side: Side } {
+  const magnitude = Math.random() < 0.72 ? 1 : Math.random() < 0.85 ? 2 : 3;
+  const up = Math.random() < 0.5;
+  const delta = TICK_SIZE * magnitude * (up ? 1 : -1);
+  const raw = price + delta;
+  const clamped = Math.min(BASE_PRICE * 1.28, Math.max(BASE_PRICE * 0.72, raw));
+  return { price: Math.round(clamped / TICK_SIZE) * TICK_SIZE, side: up ? 'BUY' : 'SELL' };
+}
 
-interface MarketDataState {
-  status: ConnectionStatus;
+function makeTick(price: number, side: Side): Tick {
+  return { id: ++tickSeq, timestamp: Date.now(), price, side };
+}
+
+function seedMarket(): MarketSnapshot {
+  let price = BASE_PRICE;
+  const ticks: Tick[] = [];
+  for (let i = 0; i < HISTORY; i++) {
+    const next = nextPrice(price);
+    price = next.price;
+    ticks.push(makeTick(price, next.side));
+  }
+  const prices = ticks.map((t) => t.price);
+  return {
+    symbol: SYMBOL,
+    name: NAME,
+    currentPrice: price,
+    prevClose: PREV_CLOSE,
+    changePercent: ((price - PREV_CLOSE) / PREV_CLOSE) * 100,
+    high: Math.max(...prices),
+    low: Math.min(...prices),
+    totalVolume: 6_400_000 + Math.round(Math.random() * 800_000),
+    orderBook: buildOrderBook(price),
+    recentTicks: ticks,
+  };
+}
+
+export function liquidationPrice(price: number, leverage: number, side: Side): number {
+  const factor = 1 / leverage;
+  return side === 'BUY' ? price * (1 - factor) : price * (1 + factor);
+}
+
+function unrealized(position: Position, price: number): number {
+  return position.side === 'BUY'
+    ? (price - position.entryPrice) * position.qty
+    : (position.entryPrice - price) * position.qty;
+}
+
+function computeEquity(portfolio: Portfolio, price: number): number {
+  return portfolio.positions
+    .filter((p) => p.status === 'OPEN')
+    .reduce((acc, p) => acc + p.margin + unrealized(p, price), portfolio.balance);
+}
+
+interface MarketState {
   symbol: string;
-  market: SymbolMarketState | null;
-  portfolio: Portfolio | null;
-  tickDirection: TickDirection;
+  market: MarketSnapshot | null;
+  status: ConnectionStatus;
   latencyMs: number | null;
+  tickDirection: 'up' | 'down' | null;
+
   leverage: Leverage;
   orderQty: number;
+  selectedPrice: number | null;
+  portfolio: Portfolio;
   effects: DopamineEvent[];
   lastRejectReason: string | null;
 
   connect: () => void;
-  disconnect: () => void;
+  advance: () => void;
   setLeverage: (leverage: Leverage) => void;
   setOrderQty: (qty: number) => void;
-  placeOrder: (side: TradeSide, orderType?: OrderType, price?: number) => void;
-  closePosition: (positionId: string) => void;
+  selectPrice: (price: number) => void;
+  placeOrder: (side: Side) => void;
+  closePosition: (id: string) => void;
   dismissEffect: (id: string) => void;
   clearRejectReason: () => void;
+  reset: () => void;
 }
 
-function pushEffect(set: (fn: (s: MarketDataState) => Partial<MarketDataState>) => void, effect: Omit<DopamineEvent, 'id' | 'createdAt'>) {
-  const event: DopamineEvent = {
-    ...effect,
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`,
-    createdAt: Date.now(),
-  };
-  set((s) => ({ effects: [...s.effects, event] }));
-}
-
-export const useMarketData = create<MarketDataState>((set, get) => ({
-  status: 'closed',
-  symbol: DEFAULT_SYMBOL,
+export const useMarketData = create<MarketState>((set, get) => ({
+  symbol: SYMBOL,
   market: null,
-  portfolio: null,
-  tickDirection: null,
+  status: 'connecting',
   latencyMs: null,
+  tickDirection: null,
+
   leverage: 1,
-  orderQty: 1,
+  orderQty: 10,
+  selectedPrice: null,
+  portfolio: { balance: STARTING_BALANCE, equity: STARTING_BALANCE, positions: [] },
   effects: [],
   lastRejectReason: null,
 
   connect: () => {
-    refCount += 1;
-    if (typeof window === 'undefined') return;
-    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) {
-      return;
-    }
-    manuallyClosed = false;
-    openSocket(set, get);
-  },
-
-  disconnect: () => {
-    refCount = Math.max(0, refCount - 1);
-    // Keep the connection alive across component remounts (e.g. React
-    // Strict Mode double-invoke) — only tear down once every consumer
-    // has unmounted.
-    if (refCount > 0) return;
-
-    manuallyClosed = true;
-    clearAllTimers();
-    socket?.close();
-    socket = null;
-    set({ status: 'closed', latencyMs: null });
-  },
-
-  setLeverage: (leverage) => set({ leverage }),
-
-  setOrderQty: (qty) => set({ orderQty: Number.isFinite(qty) && qty > 0 ? qty : 0 }),
-
-  placeOrder: (side, orderType = 'MARKET', price) => {
-    const { symbol, leverage, orderQty } = get();
-    if (orderQty <= 0) return;
-    send({
-      type: 'PLACE_ORDER',
-      symbol,
-      side,
-      orderType,
-      qty: orderQty,
-      leverage,
-      ...(price !== undefined ? { price } : {}),
+    const market = seedMarket();
+    set({
+      market,
+      status: 'open',
+      latencyMs: 18 + Math.round(Math.random() * 24),
+      portfolio: { ...get().portfolio, equity: computeEquity(get().portfolio, market.currentPrice) },
     });
   },
 
-  closePosition: (positionId) => {
-    send({ type: 'CLOSE_POSITION', positionId });
+  advance: () => {
+    const state = get();
+    const market = state.market;
+    if (!market) return;
+
+    const next = nextPrice(market.currentPrice);
+    const tick = makeTick(next.price, next.side);
+    const recentTicks = [...market.recentTicks, tick].slice(-HISTORY);
+
+    const nextMarket: MarketSnapshot = {
+      ...market,
+      currentPrice: next.price,
+      changePercent: ((next.price - market.prevClose) / market.prevClose) * 100,
+      high: Math.max(market.high, next.price),
+      low: Math.min(market.low, next.price),
+      totalVolume: market.totalVolume + Math.round(Math.random() * 4_800),
+      orderBook: buildOrderBook(next.price),
+      recentTicks,
+    };
+
+    // Liquidation sweep
+    const effects: DopamineEvent[] = [];
+    const balance = state.portfolio.balance;
+    const positions = state.portfolio.positions.map((position) => {
+      if (position.status !== 'OPEN') return position;
+      const hit =
+        position.side === 'BUY'
+          ? next.price <= position.liquidationPrice
+          : next.price >= position.liquidationPrice;
+      if (!hit) return position;
+      effects.push({
+        id: uid('fx'),
+        kind: 'loss',
+        amount: -position.margin,
+        label: 'Liquidated',
+      });
+      return { ...position, status: 'LIQUIDATED' as const };
+    });
+
+    const portfolio: Portfolio = { balance, equity: 0, positions };
+    portfolio.equity = computeEquity(portfolio, next.price);
+
+    set({
+      market: nextMarket,
+      tickDirection: next.price > market.currentPrice ? 'up' : next.price < market.currentPrice ? 'down' : state.tickDirection,
+      latencyMs: 14 + Math.round(Math.random() * 30),
+      portfolio,
+      effects: effects.length ? [...state.effects, ...effects] : state.effects,
+    });
   },
 
-  dismissEffect: (id) => set((s) => ({ effects: s.effects.filter((e) => e.id !== id) })),
+  setLeverage: (leverage) => set({ leverage }),
+  setOrderQty: (qty) => set({ orderQty: Math.max(0, Math.round(qty * 100) / 100) }),
+  selectPrice: (price) => set({ selectedPrice: price }),
 
+  placeOrder: (side) => {
+    const state = get();
+    const price = state.market?.currentPrice ?? 0;
+    const qty = state.orderQty;
+    if (!price || qty <= 0) {
+      set({ lastRejectReason: 'Enter a quantity greater than zero.' });
+      return;
+    }
+    const margin = (qty * price) / state.leverage;
+    if (margin > state.portfolio.balance) {
+      set({ lastRejectReason: 'Not enough cash for this size and leverage.' });
+      return;
+    }
+
+    const position: Position = {
+      id: uid('pos'),
+      symbol: state.symbol,
+      side,
+      qty,
+      entryPrice: price,
+      leverage: state.leverage,
+      margin,
+      liquidationPrice: liquidationPrice(price, state.leverage, side),
+      status: 'OPEN',
+      openedAt: Date.now(),
+    };
+
+    const portfolio: Portfolio = {
+      balance: state.portfolio.balance - margin,
+      equity: 0,
+      positions: [position, ...state.portfolio.positions],
+    };
+    portfolio.equity = computeEquity(portfolio, price);
+
+    set({
+      portfolio,
+      lastRejectReason: null,
+      effects: [
+        ...state.effects,
+        {
+          id: uid('fx'),
+          kind: side === 'BUY' ? 'long' : 'short',
+          amount: 0,
+          label: `${state.leverage}x ${side === 'BUY' ? 'Long' : 'Short'} filled`,
+        },
+      ],
+    });
+  },
+
+  closePosition: (id) => {
+    const state = get();
+    const price = state.market?.currentPrice ?? 0;
+    const target = state.portfolio.positions.find((p) => p.id === id);
+    if (!target || target.status !== 'OPEN') return;
+
+    const pnl = unrealized(target, price);
+    const positions = state.portfolio.positions.map((p) =>
+      p.id === id ? { ...p, status: 'CLOSED' as const } : p,
+    );
+    const portfolio: Portfolio = {
+      balance: state.portfolio.balance + target.margin + pnl,
+      equity: 0,
+      positions,
+    };
+    portfolio.equity = computeEquity(portfolio, price);
+
+    set({
+      portfolio,
+      effects: [
+        ...state.effects,
+        {
+          id: uid('fx'),
+          kind: pnl >= 0 ? 'profit' : 'loss',
+          amount: pnl,
+          label: pnl >= 0 ? 'Profit realized' : 'Loss realized',
+        },
+      ],
+    });
+  },
+
+  dismissEffect: (id) => set({ effects: get().effects.filter((e) => e.id !== id) }),
   clearRejectReason: () => set({ lastRejectReason: null }),
+  reset: () =>
+    set({
+      portfolio: { balance: STARTING_BALANCE, equity: STARTING_BALANCE, positions: [] },
+      effects: [],
+      lastRejectReason: null,
+    }),
 }));
 
-// ---------------------------------------------------------------------------
-// Socket lifecycle
-// ---------------------------------------------------------------------------
-
-function openSocket(
-  set: (partial: Partial<MarketDataState> | ((s: MarketDataState) => Partial<MarketDataState>)) => void,
-  get: () => MarketDataState,
-) {
-  set({ status: reconnectAttempts > 0 ? 'reconnecting' : 'connecting' });
-
-  const ws = new WebSocket(WS_URL);
-  socket = ws;
-
-  ws.onopen = () => {
-    reconnectAttempts = 0;
-    set({ status: 'open' });
-    startHeartbeat(set);
-  };
-
-  ws.onmessage = (event) => {
-    let message: ServerMessage;
-    try {
-      message = JSON.parse(event.data as string) as ServerMessage;
-    } catch {
-      return;
-    }
-    handleServerMessage(message, set, get);
-  };
-
-  ws.onerror = () => {
-    // 'close' fires immediately after in browsers — no separate handling needed.
-  };
-
-  ws.onclose = () => {
-    stopHeartbeat();
-    if (socket === ws) socket = null;
-    if (manuallyClosed) {
-      set({ status: 'closed' });
-      return;
-    }
-    set({ status: 'reconnecting', latencyMs: null });
-    scheduleReconnect(set, get);
-  };
-}
-
-function scheduleReconnect(
-  set: (partial: Partial<MarketDataState> | ((s: MarketDataState) => Partial<MarketDataState>)) => void,
-  get: () => MarketDataState,
-) {
-  if (reconnectTimer) return;
-  const delay = Math.min(BASE_RECONNECT_DELAY_MS * 2 ** reconnectAttempts, MAX_RECONNECT_DELAY_MS);
-  reconnectAttempts += 1;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    if (manuallyClosed) return;
-    openSocket(set, get);
-  }, delay);
-}
-
-function startHeartbeat(set: (partial: Partial<MarketDataState> | ((s: MarketDataState) => Partial<MarketDataState>)) => void) {
-  stopHeartbeat();
-  pingTimer = setInterval(() => {
-    pingSentAt = performance.now();
-    send({ type: 'PING' });
-  }, PING_INTERVAL_MS);
-  void set;
-}
-
-function stopHeartbeat() {
-  if (pingTimer) {
-    clearInterval(pingTimer);
-    pingTimer = null;
-  }
-}
-
-function clearAllTimers() {
-  stopHeartbeat();
-  if (reconnectTimer) {
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-  }
-  if (flashTimer) {
-    clearTimeout(flashTimer);
-    flashTimer = null;
-  }
-  reconnectAttempts = 0;
-}
-
-function send(message: ClientMessage) {
-  if (!socket || socket.readyState !== WebSocket.OPEN) return;
-  socket.send(JSON.stringify(message));
-}
-
-// ---------------------------------------------------------------------------
-// Server -> client message handling (delta application, no full re-fetch)
-// ---------------------------------------------------------------------------
-
-function handleServerMessage(
-  message: ServerMessage,
-  set: (partial: Partial<MarketDataState> | ((s: MarketDataState) => Partial<MarketDataState>)) => void,
-  get: () => MarketDataState,
-) {
-  switch (message.type) {
-    case 'SNAPSHOT': {
-      set({ symbol: message.symbol, market: message.market, portfolio: message.portfolio });
-      return;
-    }
-
-    case 'TICK_UPDATE': {
-      const prevPrice = get().market?.currentPrice;
-      flashTick(set, prevPrice, message.currentPrice);
-      set((s) => ({
-        market: s.market
-          ? {
-              ...s.market,
-              currentPrice: message.currentPrice,
-              changePercent: message.changePercent,
-              totalVolume: message.totalVolume,
-              orderBook: message.orderBook,
-              recentTicks: [...s.market.recentTicks, message.tick].slice(-50),
-              updatedAt: Date.now(),
-            }
-          : s.market,
-      }));
-      return;
-    }
-
-    case 'ORDER_ACK': {
-      const { order, portfolio } = message;
-      set({ portfolio });
-      pushEffect(set, {
-        amount: order.side === 'BUY' ? order.qty * order.fillPrice : -(order.qty * order.fillPrice),
-        kind: order.side === 'BUY' ? 'long' : 'short',
-        label: order.side === 'BUY' ? 'LONG FILLED' : 'SHORT FILLED',
-      });
-      return;
-    }
-
-    case 'ORDER_REJECT': {
-      set({ lastRejectReason: message.reason });
-      return;
-    }
-
-    case 'POSITION_CLOSED':
-    case 'POSITION_LIQUIDATED': {
-      const { position, portfolio } = message;
-      set({ portfolio });
-      const pnl = position.realizedPnl ?? 0;
-      pushEffect(set, {
-        amount: pnl,
-        kind: pnl >= 0 ? 'profit' : 'loss',
-        label: message.type === 'POSITION_LIQUIDATED' ? 'LIQUIDATED' : 'CLOSED',
-      });
-      return;
-    }
-
-    case 'PORTFOLIO_UPDATE': {
-      set({ portfolio: message.portfolio });
-      return;
-    }
-
-    case 'PONG': {
-      if (pingSentAt > 0) {
-        set({ latencyMs: Math.max(0, Math.round(performance.now() - pingSentAt)) });
-      }
-      return;
-    }
-
-    case 'ERROR': {
-      set({ lastRejectReason: message.message });
-      return;
-    }
-
-    default:
-      return;
-  }
-}
-
-function flashTick(
-  set: (partial: Partial<MarketDataState> | ((s: MarketDataState) => Partial<MarketDataState>)) => void,
-  prevPrice: number | undefined,
-  nextPrice: number,
-) {
-  if (prevPrice === undefined || nextPrice === prevPrice) return;
-  const direction: TickDirection = nextPrice > prevPrice ? 'up' : 'down';
-  set({ tickDirection: direction });
-  if (flashTimer) clearTimeout(flashTimer);
-  flashTimer = setTimeout(() => {
-    useMarketData.setState({ tickDirection: null });
-    flashTimer = null;
-  }, FLASH_RESET_MS);
-}
-
-// ---------------------------------------------------------------------------
-// React entry point — mount once near the root of the trading terminal.
-// Safe to call from multiple components; the socket is reference-counted.
-// ---------------------------------------------------------------------------
-
-export function useMarketDataConnection(): void {
-  const connect = useMarketData((s) => s.connect);
-  const disconnect = useMarketData((s) => s.disconnect);
+/** Boots the mock feed on mount and streams ticks while mounted. */
+export function useMarketDataConnection(intervalMs = 900) {
+  const started = useRef(false);
 
   useEffect(() => {
-    connect();
-    return () => disconnect();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+    const store = useMarketData.getState();
+    if (!started.current) {
+      started.current = true;
+      if (!store.market) store.connect();
+    }
+    const id = window.setInterval(() => useMarketData.getState().advance(), intervalMs);
+    return () => window.clearInterval(id);
+  }, [intervalMs]);
 }

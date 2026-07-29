@@ -1,116 +1,188 @@
 'use client';
 
-import { AlertTriangle, Minus, Plus, Skull, TrendingDown, TrendingUp, X } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
-import { useMarketData } from '@/hooks/useMarketData';
-import type { Position } from '@/types/trading';
+import { AnimatePresence, motion } from 'framer-motion';
+import { ChevronDown, CircleAlert, HelpCircle, Minus, Plus } from 'lucide-react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
+import { liquidationPrice, useMarketData } from '@/hooks/useMarketData';
+import { formatNumber, formatWon } from '@/lib/format';
+import type { Side } from '@/types/trading';
+import { LeverageSelector } from './LeverageSelector';
+import { Panel } from './Panel';
 
-const EMPTY_POSITIONS: Position[] = [];
+const QUICK_RATIOS = [0.1, 0.25, 0.5, 1] as const;
+const QUICK_LABELS = ['10%', '25%', '50%', 'Max'] as const;
 
-function formatKrw(value: number): string {
-  const rounded = Math.round(value);
-  const sign = rounded > 0 ? '+' : '';
-  return `${sign}₩${rounded.toLocaleString('ko-KR')}`;
-}
-
-function formatPrice(value: number): string {
-  return `₩${Math.round(value).toLocaleString('ko-KR')}`;
-}
-
-/** Long: price * (1 - 1/lev). Short: price * (1 + 1/lev). Mirrors MatchingEngine. */
-function estimateLiquidationPrice(price: number, leverage: number, side: 'BUY' | 'SELL'): number {
-  const factor = 1 / leverage;
-  return side === 'BUY' ? price * (1 - factor) : price * (1 + factor);
-}
-
-function PositionRow({ position, currentPrice }: { position: Position; currentPrice: number }) {
-  const closePosition = useMarketData((s) => s.closePosition);
-  const isLong = position.side === 'BUY';
-
-  const unrealizedPnl = isLong
-    ? (currentPrice - position.entryPrice) * position.qty
-    : (position.entryPrice - currentPrice) * position.qty;
-
-  const pnlPct = position.margin > 0 ? (unrealizedPnl / position.margin) * 100 : 0;
-  const isProfit = unrealizedPnl >= 0;
-
-  const distanceToLiqPct =
-    isLong
-      ? ((currentPrice - position.liquidationPrice) / currentPrice) * 100
-      : ((position.liquidationPrice - currentPrice) / currentPrice) * 100;
-  const nearLiquidation = distanceToLiqPct < 15;
-
+/** Large Buy/Sell tab — sets the tone (red/blue) for the whole order form. */
+function SideToggle({ side, onChange }: { side: Side; onChange: (side: Side) => void }) {
   return (
-    <div className="rounded-md border border-slate-800 bg-slate-950 p-2.5">
-      <div className="flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <span
-            className={`flex items-center gap-1 rounded px-1.5 py-0.5 text-[10px] font-bold ${
-              isLong ? 'bg-emerald-500/15 text-emerald-400' : 'bg-rose-500/15 text-rose-400'
+    <div className="grid grid-cols-2 gap-1.5" role="group" aria-label="Order side">
+      <button
+        type="button"
+        aria-pressed={side === 'BUY'}
+        onClick={() => onChange('BUY')}
+        className={`h-10 rounded-xl text-[14px] font-bold transition-colors ${
+          side === 'BUY'
+            ? 'bg-up text-white'
+            : 'bg-secondary text-muted-foreground hover:text-foreground'
+        }`}
+      >
+        Buy
+      </button>
+      <button
+        type="button"
+        aria-pressed={side === 'SELL'}
+        onClick={() => onChange('SELL')}
+        className={`h-10 rounded-xl text-[14px] font-bold transition-colors ${
+          side === 'SELL'
+            ? 'bg-down text-white'
+            : 'bg-secondary text-muted-foreground hover:text-foreground'
+        }`}
+      >
+        Sell
+      </button>
+    </div>
+  );
+}
+
+/** Label on the left, control on the right — the Toss order-form rhythm. */
+function Field({ label, children }: { label: ReactNode; children: ReactNode }) {
+  return (
+    <div className="grid grid-cols-[84px_minmax(0,1fr)] items-center gap-3">
+      <span className="text-[12px] font-medium text-muted-foreground">{label}</span>
+      <div className="min-w-0">{children}</div>
+    </div>
+  );
+}
+
+function Segmented({
+  options,
+  value,
+  onChange,
+  label,
+}: {
+  options: readonly string[];
+  value: string;
+  onChange: (v: string) => void;
+  label: string;
+}) {
+  return (
+    <div
+      className="flex items-center gap-0.5 rounded-lg bg-secondary p-0.5"
+      role="group"
+      aria-label={label}
+    >
+      {options.map((option) => {
+        const active = option === value;
+        return (
+          <button
+            key={option}
+            type="button"
+            aria-pressed={active}
+            onClick={() => onChange(option)}
+            className={`flex-1 rounded-md py-1.5 text-[12px] font-bold transition-colors ${
+              active
+                ? 'bg-card text-foreground shadow-toss'
+                : 'text-muted-foreground hover:text-foreground'
             }`}
           >
-            {isLong ? <TrendingUp size={10} /> : <TrendingDown size={10} />}
-            {isLong ? 'LONG' : 'SHORT'} {position.leverage}x
-          </span>
-          <span className="font-mono text-[11px] text-slate-500">qty {position.qty}</span>
-        </div>
-        <button
-          type="button"
-          onClick={() => closePosition(position.id)}
-          className="flex items-center gap-1 rounded bg-slate-800 px-2 py-1 text-[10px] font-semibold text-slate-300 transition-colors hover:bg-slate-700"
-        >
-          <X size={10} /> Close
-        </button>
-      </div>
+            {option}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
 
-      <div className="mt-2 grid grid-cols-3 gap-1 text-[11px]">
-        <div>
-          <p className="text-slate-500">Entry</p>
-          <p className="font-mono text-slate-300">{formatPrice(position.entryPrice)}</p>
-        </div>
-        <div>
-          <p className="text-slate-500">Liq. Price</p>
-          <p className={`font-mono ${nearLiquidation ? 'text-rose-400' : 'text-slate-300'}`}>
-            {formatPrice(position.liquidationPrice)}
-          </p>
-        </div>
-        <div>
-          <p className="text-slate-500">Unrealized</p>
-          <p className={`font-mono font-semibold ${isProfit ? 'text-emerald-400' : 'text-rose-400'}`}>
-            {formatKrw(unrealizedPnl)}
-          </p>
-        </div>
-      </div>
+/** Numeric input with unit suffix and −/+ steppers, matching Toss price rows. */
+function StepperInput({
+  value,
+  onChange,
+  unit,
+  step,
+  ariaLabel,
+  placeholder,
+}: {
+  value: string;
+  onChange: (next: string) => void;
+  unit?: string;
+  step: number;
+  ariaLabel: string;
+  placeholder?: string;
+}) {
+  const nudge = (dir: 1 | -1) => {
+    const parsed = Number(value) || 0;
+    onChange(String(Math.max(0, parsed + dir * step)));
+  };
 
-      <div className="mt-1.5 flex items-center justify-between text-[10px]">
-        <span className={isProfit ? 'text-emerald-500/80' : 'text-rose-500/80'}>
-          {isProfit ? '+' : ''}
-          {pnlPct.toFixed(1)}% of margin
-        </span>
-        {nearLiquidation && (
-          <span className="flex items-center gap-1 font-semibold text-rose-400">
-            <AlertTriangle size={10} /> Near liquidation
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="flex h-9 min-w-0 flex-1 items-center rounded-lg border border-border bg-secondary/60 px-2.5 focus-within:border-primary">
+        <input
+          inputMode="decimal"
+          aria-label={ariaLabel}
+          placeholder={placeholder}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          className="h-full w-full min-w-0 bg-transparent text-right text-[13px] font-bold tabular-nums text-foreground outline-none placeholder:font-medium placeholder:text-muted-foreground"
+        />
+        {unit && (
+          <span className="ml-1.5 shrink-0 text-[12px] font-semibold text-muted-foreground">
+            {unit}
           </span>
         )}
       </div>
+      <button
+        type="button"
+        aria-label={`Decrease ${ariaLabel}`}
+        onClick={() => nudge(-1)}
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border bg-secondary/60 text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <Minus size={14} />
+      </button>
+      <button
+        type="button"
+        aria-label={`Increase ${ariaLabel}`}
+        onClick={() => nudge(1)}
+        className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-border bg-secondary/60 text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <Plus size={14} />
+      </button>
     </div>
   );
 }
 
 export function OrderPanel() {
-  const symbol = useMarketData((s) => s.symbol);
   const currentPrice = useMarketData((s) => s.market?.currentPrice) ?? 0;
   const leverage = useMarketData((s) => s.leverage);
   const orderQty = useMarketData((s) => s.orderQty);
   const setOrderQty = useMarketData((s) => s.setOrderQty);
   const placeOrder = useMarketData((s) => s.placeOrder);
-  const balance = useMarketData((s) => s.portfolio?.balance) ?? 0;
-  const equity = useMarketData((s) => s.portfolio?.equity) ?? 0;
-  const positions = useMarketData((s) => s.portfolio?.positions) ?? EMPTY_POSITIONS;
+  const balance = useMarketData((s) => s.portfolio.balance);
   const lastRejectReason = useMarketData((s) => s.lastRejectReason);
   const clearRejectReason = useMarketData((s) => s.clearRejectReason);
+  const selectedPrice = useMarketData((s) => s.selectedPrice);
 
-  const [qtyInput, setQtyInput] = useState('1');
+  const [side, setSide] = useState<Side>('BUY');
+  const [priceMode, setPriceMode] = useState('Limit');
+  const [unitMode, setUnitMode] = useState('Shares');
+  const [qtyInput, setQtyInput] = useState(String(orderQty));
+  const [priceInput, setPriceInput] = useState('');
+
+  // Keep the limit field tracking the market until the user edits it.
+  const [priceTouched, setPriceTouched] = useState(false);
+  useEffect(() => {
+    if (!priceTouched && currentPrice) setPriceInput(String(currentPrice));
+  }, [currentPrice, priceTouched]);
+
+  // Clicking a depth-of-book row fills the limit price, like a real terminal.
+  const lastSelected = useRef<number | null>(null);
+  useEffect(() => {
+    if (selectedPrice === null || selectedPrice === lastSelected.current) return;
+    lastSelected.current = selectedPrice;
+    setPriceMode('Limit');
+    setPriceTouched(true);
+    setPriceInput(String(selectedPrice));
+  }, [selectedPrice]);
 
   useEffect(() => {
     if (!lastRejectReason) return;
@@ -118,150 +190,153 @@ export function OrderPanel() {
     return () => clearTimeout(t);
   }, [lastRejectReason, clearRejectReason]);
 
-  const openPositions = useMemo(
-    () => positions.filter((p) => p.status === 'OPEN' && p.symbol === symbol),
-    [positions, symbol],
-  );
-
   const notional = orderQty * currentPrice;
   const requiredMargin = leverage > 0 ? notional / leverage : 0;
-  const longLiqPrice = estimateLiquidationPrice(currentPrice, leverage, 'BUY');
-  const shortLiqPrice = estimateLiquidationPrice(currentPrice, leverage, 'SELL');
-  const insufficientMargin = requiredMargin > balance || orderQty <= 0;
+  const insufficient = requiredMargin > balance || orderQty <= 0;
 
-  function commitQty(next: number) {
-    const clamped = Math.max(0, Math.round(next * 100) / 100);
-    setOrderQty(clamped);
-    setQtyInput(String(clamped));
+  function commitQty(raw: string) {
+    setQtyInput(raw);
+    const parsed = Number(raw);
+    if (Number.isFinite(parsed) && parsed >= 0) setOrderQty(parsed);
+  }
+
+  function applyRatio(ratio: number) {
+    if (!currentPrice) return;
+    const next = Math.floor(((balance * ratio) / currentPrice) * leverage);
+    setOrderQty(next);
+    setQtyInput(String(next));
   }
 
   return (
-    <div className="flex flex-col gap-3 rounded-lg border border-slate-800 bg-slate-900/60 p-4">
-      <div className="flex items-center justify-between">
-        <h2 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Execute</h2>
-        <div className="text-right text-[11px] text-slate-500">
-          <p>
-            Cash <span className="font-mono text-slate-300">{formatPrice(balance)}</span>
-          </p>
-          <p>
-            Equity <span className="font-mono text-slate-300">{formatPrice(equity)}</span>
-          </p>
-        </div>
-      </div>
+    <Panel title="Order" bodyClassName="flex flex-col gap-3.5 p-3.5">
+      <SideToggle side={side} onChange={setSide} />
 
-      {/* Quantity stepper */}
-      <div>
-        <label className="mb-1 block text-[10px] uppercase tracking-wider text-slate-500">Quantity</label>
-        <div className="flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => commitQty(orderQty - 1)}
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-slate-800 bg-slate-950 text-slate-300 transition-colors hover:bg-slate-800"
-          >
-            <Minus size={14} />
-          </button>
-          <input
-            type="number"
-            inputMode="decimal"
-            min={0}
-            value={qtyInput}
-            onChange={(e) => {
-              setQtyInput(e.target.value);
-              const parsed = Number(e.target.value);
-              if (Number.isFinite(parsed) && parsed >= 0) setOrderQty(parsed);
-            }}
-            onBlur={() => commitQty(Number(qtyInput) || 0)}
-            className="h-9 w-full rounded-md border border-slate-800 bg-slate-950 text-center font-mono text-sm text-slate-100 outline-none focus:border-slate-600"
-          />
-          <button
-            type="button"
-            onClick={() => commitQty(orderQty + 1)}
-            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-slate-800 bg-slate-950 text-slate-300 transition-colors hover:bg-slate-800"
-          >
-            <Plus size={14} />
-          </button>
-        </div>
-      </div>
-
-      {/* Live calc summary */}
-      <div className="grid grid-cols-2 gap-2 rounded-md bg-slate-950 p-2.5 text-[11px]">
-        <div>
-          <p className="text-slate-500">Notional</p>
-          <p className="font-mono text-slate-300">{formatPrice(notional)}</p>
-        </div>
-        <div>
-          <p className="text-slate-500">Required Margin</p>
-          <p className={`font-mono font-semibold ${insufficientMargin ? 'text-rose-400' : 'text-slate-200'}`}>
-            {formatPrice(requiredMargin)}
-          </p>
-        </div>
-        <div>
-          <p className="text-slate-500">Est. Liq. (Long)</p>
-          <p className="font-mono text-emerald-400/80">{formatPrice(longLiqPrice)}</p>
-        </div>
-        <div>
-          <p className="text-slate-500">Est. Liq. (Short)</p>
-          <p className="font-mono text-rose-400/80">{formatPrice(shortLiqPrice)}</p>
-        </div>
-      </div>
-
-      {insufficientMargin && (
-        <div className="flex items-center gap-1.5 rounded-md bg-rose-500/10 px-2.5 py-1.5 text-[11px] font-medium text-rose-400">
-          <AlertTriangle size={12} />
-          Insufficient balance for this size/leverage.
-        </div>
-      )}
-
-      {lastRejectReason && (
-        <div className="flex items-center gap-1.5 rounded-md bg-rose-500/10 px-2.5 py-1.5 text-[11px] font-medium text-rose-400">
-          <Skull size={12} />
-          {lastRejectReason}
-        </div>
-      )}
-
-      {/* One-tap execution */}
-      <div className="grid grid-cols-2 gap-2">
+      <Field label="Order type">
         <button
           type="button"
-          disabled={insufficientMargin}
-          onClick={() => placeOrder('BUY')}
-          className="flex flex-col items-center justify-center gap-0.5 rounded-md bg-emerald-500 py-3 font-bold text-slate-950 transition-all duration-100 active:scale-[0.97] disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-600"
+          className="flex h-9 w-full items-center justify-between rounded-lg border border-border bg-secondary/60 px-3 text-[13px] font-semibold text-foreground transition-colors hover:border-muted-foreground/40"
         >
-          <span className="flex items-center gap-1 text-sm">
-            <TrendingUp size={16} /> BUY / LONG
-          </span>
-          <span className="text-[10px] font-normal opacity-80">{leverage}x</span>
+          Standard order
+          <ChevronDown size={14} className="text-muted-foreground" aria-hidden />
         </button>
-        <button
-          type="button"
-          disabled={insufficientMargin}
-          onClick={() => placeOrder('SELL')}
-          className="flex flex-col items-center justify-center gap-0.5 rounded-md bg-rose-500 py-3 font-bold text-slate-950 transition-all duration-100 active:scale-[0.97] disabled:cursor-not-allowed disabled:bg-slate-800 disabled:text-slate-600"
-        >
-          <span className="flex items-center gap-1 text-sm">
-            <TrendingDown size={16} /> SELL / SHORT
+      </Field>
+
+      <Field label="Unit">
+        <Segmented
+          options={['Shares', 'Fractional']}
+          value={unitMode}
+          onChange={setUnitMode}
+          label="Order unit"
+        />
+      </Field>
+
+      <Field label="Leverage">
+        <LeverageSelector />
+      </Field>
+
+      <Field label="Price">
+        <Segmented
+          options={['Limit', 'Market']}
+          value={priceMode}
+          onChange={setPriceMode}
+          label="Price type"
+        />
+      </Field>
+
+      <Field label="">
+        <StepperInput
+          value={priceMode === 'Market' ? String(currentPrice) : priceInput}
+          onChange={(v) => {
+            setPriceTouched(true);
+            setPriceInput(v);
+          }}
+          unit="원"
+          step={100}
+          ariaLabel="Limit price"
+        />
+      </Field>
+
+      <Field label="Quantity">
+        <StepperInput
+          value={qtyInput}
+          onChange={commitQty}
+          step={1}
+          ariaLabel="Order quantity"
+          placeholder="Enter quantity"
+        />
+      </Field>
+
+      <Field label="">
+        <div className="grid grid-cols-4 gap-1.5">
+          {QUICK_RATIOS.map((ratio, i) => (
+            <button
+              key={ratio}
+              type="button"
+              onClick={() => applyRatio(ratio)}
+              className="rounded-lg border border-border bg-secondary/60 py-1.5 text-[12px] font-bold text-secondary-foreground transition-colors hover:border-muted-foreground/40 hover:text-foreground"
+            >
+              {QUICK_LABELS[i]}
+            </button>
+          ))}
+        </div>
+      </Field>
+
+      <Field label="Order total">
+        <div className="flex h-9 items-center justify-end rounded-lg border border-border bg-secondary/60 px-2.5">
+          <span className="text-[13px] font-bold tabular-nums text-foreground">
+            {formatWon(notional)}
           </span>
-          <span className="text-[10px] font-normal opacity-80">{leverage}x</span>
-        </button>
+        </div>
+      </Field>
+
+      <div className="grid grid-cols-[84px_minmax(0,1fr)] gap-3">
+        <span />
+        <div className="flex flex-col gap-1.5 text-[11px] font-medium">
+          <span className="flex items-center gap-1 text-muted-foreground">
+            Buying power {formatWon(balance)}
+            <HelpCircle size={12} aria-hidden />
+          </span>
+          <span className="flex items-center justify-between tabular-nums">
+            <span className="text-muted-foreground">Margin required</span>
+            <span className={insufficient ? 'text-destructive' : 'text-foreground'}>
+              {formatWon(requiredMargin)}
+            </span>
+          </span>
+          <span className="flex items-center justify-between tabular-nums">
+            <span className="text-muted-foreground">Liquidation L / S</span>
+            <span className="text-foreground">
+              {leverage === 1 ? '—' : formatNumber(liquidationPrice(currentPrice, leverage, 'BUY'))}
+              {' / '}
+              {formatNumber(liquidationPrice(currentPrice, leverage, 'SELL'))}
+            </span>
+          </span>
+        </div>
       </div>
 
-      {/* Position summary */}
-      <div className="mt-1 flex flex-col gap-2">
-        <h3 className="text-[10px] uppercase tracking-wider text-slate-500">
-          Open Positions {openPositions.length > 0 && `(${openPositions.length})`}
-        </h3>
-        {openPositions.length === 0 ? (
-          <p className="rounded-md border border-dashed border-slate-800 py-4 text-center text-[11px] text-slate-600">
-            No open positions on {symbol}
-          </p>
-        ) : (
-          <div className="flex max-h-64 flex-col gap-2 overflow-y-auto pr-0.5">
-            {openPositions.map((position) => (
-              <PositionRow key={position.id} position={position} currentPrice={currentPrice} />
-            ))}
-          </div>
+      <AnimatePresence initial={false}>
+        {(insufficient || lastRejectReason) && (
+          <motion.p
+            initial={{ opacity: 0, y: -4 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -4 }}
+            className="flex items-center gap-1.5 rounded-lg bg-up-soft px-3 py-2 text-[12px] font-semibold text-destructive"
+          >
+            <CircleAlert size={13} className="shrink-0" />
+            {lastRejectReason ?? 'Enter a quantity your buying power supports.'}
+          </motion.p>
         )}
-      </div>
-    </div>
+      </AnimatePresence>
+
+      <button
+        type="button"
+        disabled={insufficient}
+        onClick={() => placeOrder(side)}
+        className={`mt-auto h-12 rounded-xl text-[15px] font-bold text-white transition-opacity hover:opacity-90 active:scale-[0.99] disabled:bg-secondary disabled:text-muted-foreground disabled:opacity-100 ${
+          side === 'BUY' ? 'bg-up' : 'bg-down'
+        }`}
+      >
+        {side === 'BUY' ? 'Buy' : 'Sell'}
+      </button>
+    </Panel>
   );
 }

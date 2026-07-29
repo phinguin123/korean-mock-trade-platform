@@ -1,233 +1,64 @@
-/**
- * Frontend-side mirror of the backend's wire schema
- * (`src/types/market.ts` on the Node/WebSocket server).
- *
- * Keeping this file structurally identical to the backend types guarantees
- * zero drift between what the server emits and what the UI expects.
- */
+export type Side = 'BUY' | 'SELL';
 
-// ---------------------------------------------------------------------------
-// Market data primitives
-// ---------------------------------------------------------------------------
+export const ALLOWED_LEVERAGES = [1, 2, 3, 5] as const;
+export type Leverage = (typeof ALLOWED_LEVERAGES)[number];
 
-export type TradeSide = 'BUY' | 'SELL';
+export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'closed';
 
-export type OrderType = 'MARKET' | 'LIMIT';
+export interface Tick {
+  id: number;
+  timestamp: number;
+  price: number;
+  side: Side;
+}
 
-export type Leverage = 1 | 2 | 3 | 5;
-
-export const ALLOWED_LEVERAGES: Leverage[] = [1, 2, 3, 5];
-
-/** A single price level in the order book (top-of-book aggregated). */
 export interface OrderBookLevel {
   price: number;
   volume: number;
 }
 
-/** Level-2 style order book snapshot: top N bids/asks, best price first. */
-export interface OrderBook {
-  bids: OrderBookLevel[]; // sorted descending by price (best bid first)
-  asks: OrderBookLevel[]; // sorted ascending by price (best ask first)
+export interface OrderBookSnapshot {
+  bids: OrderBookLevel[];
+  asks: OrderBookLevel[];
 }
 
-/** A single executed tick trade printed on the tape. */
-export interface Tick {
-  price: number;
-  volume: number;
-  timestamp: number; // epoch millis
-  side: TradeSide;
-}
-
-/** Full atomic market state for one symbol, as cached in RAM on the server. */
-export interface SymbolMarketState {
+export interface MarketSnapshot {
   symbol: string;
   name: string;
   currentPrice: number;
   prevClose: number;
   changePercent: number;
+  high: number;
+  low: number;
   totalVolume: number;
-  orderBook: OrderBook;
-  recentTicks: Tick[]; // most recent last-50 ticks, newest last
-  updatedAt: number; // epoch millis of last mutation
+  orderBook: OrderBookSnapshot;
+  recentTicks: Tick[];
 }
-
-// ---------------------------------------------------------------------------
-// Virtual trading domain
-// ---------------------------------------------------------------------------
 
 export type PositionStatus = 'OPEN' | 'CLOSED' | 'LIQUIDATED';
 
-/** An open (or historical) leveraged position held by a virtual user. */
 export interface Position {
   id: string;
-  userId: string;
   symbol: string;
-  side: TradeSide; // BUY = long, SELL = short
-  entryPrice: number;
+  side: Side;
   qty: number;
+  entryPrice: number;
   leverage: Leverage;
-  margin: number; // capital locked against this position
+  margin: number;
   liquidationPrice: number;
   status: PositionStatus;
   openedAt: number;
-  closedAt?: number;
-  closePrice?: number;
-  realizedPnl?: number;
 }
 
-/** A processed (filled, rejected) order record kept for audit/history. */
-export interface TradeOrder {
-  id: string;
-  userId: string;
-  symbol: string;
-  side: TradeSide;
-  orderType: OrderType;
-  requestedPrice?: number; // required for LIMIT orders
-  fillPrice: number;
-  qty: number;
-  leverage: Leverage;
-  margin: number;
-  status: 'FILLED' | 'REJECTED';
-  rejectReason?: string;
-  createdAt: number;
-}
-
-/** A virtual user's full account snapshot. */
 export interface Portfolio {
-  userId: string;
-  balance: number; // free cash, excludes locked margin
-  equity: number; // balance + unrealized PnL of open positions
-  marginUsed: number; // sum of margin currently locked in open positions
+  balance: number;
+  equity: number;
   positions: Position[];
 }
 
-// ---------------------------------------------------------------------------
-// Client -> Server websocket messages
-// ---------------------------------------------------------------------------
-
-export interface PlaceOrderMessage {
-  type: 'PLACE_ORDER';
-  symbol: string;
-  side: TradeSide;
-  orderType: OrderType;
-  price?: number;
-  qty: number;
-  leverage: Leverage;
-}
-
-export interface ClosePositionMessage {
-  type: 'CLOSE_POSITION';
-  positionId: string;
-}
-
-export interface SubscribeMessage {
-  type: 'SUBSCRIBE';
-  symbol: string;
-}
-
-export interface PingMessage {
-  type: 'PING';
-}
-
-export type ClientMessage =
-  | PlaceOrderMessage
-  | ClosePositionMessage
-  | SubscribeMessage
-  | PingMessage;
-
-// ---------------------------------------------------------------------------
-// Server -> Client websocket messages
-// ---------------------------------------------------------------------------
-
-export interface SnapshotMessage {
-  type: 'SNAPSHOT';
-  symbol: string;
-  market: SymbolMarketState;
-  portfolio: Portfolio;
-  serverTime: number;
-}
-
-/** Lightweight, high-frequency delta pushed on every tick. */
-export interface TickUpdateMessage {
-  type: 'TICK_UPDATE';
-  symbol: string;
-  currentPrice: number;
-  changePercent: number;
-  totalVolume: number;
-  orderBook: OrderBook;
-  tick: Tick;
-}
-
-export interface OrderAckMessage {
-  type: 'ORDER_ACK';
-  order: TradeOrder;
-  portfolio: Portfolio;
-}
-
-export interface OrderRejectMessage {
-  type: 'ORDER_REJECT';
-  reason: string;
-  request: PlaceOrderMessage;
-}
-
-export interface PositionClosedMessage {
-  type: 'POSITION_CLOSED';
-  position: Position;
-  portfolio: Portfolio;
-}
-
-export interface PositionLiquidatedMessage {
-  type: 'POSITION_LIQUIDATED';
-  position: Position;
-  portfolio: Portfolio;
-}
-
-export interface PortfolioUpdateMessage {
-  type: 'PORTFOLIO_UPDATE';
-  portfolio: Portfolio;
-}
-
-export interface ErrorMessage {
-  type: 'ERROR';
-  message: string;
-}
-
-export interface PongMessage {
-  type: 'PONG';
-  serverTime: number;
-}
-
-export type ServerMessage =
-  | SnapshotMessage
-  | TickUpdateMessage
-  | OrderAckMessage
-  | OrderRejectMessage
-  | PositionClosedMessage
-  | PositionLiquidatedMessage
-  | PortfolioUpdateMessage
-  | ErrorMessage
-  | PongMessage;
-
-/** Union of every message that can travel across the websocket wire. */
-export type WSMessage = ClientMessage | ServerMessage;
-
-// ---------------------------------------------------------------------------
-// Frontend-only UI state (no backend equivalent)
-// ---------------------------------------------------------------------------
-
-/** WebSocket connection lifecycle, surfaced in the UI as a status pill. */
-export type ConnectionStatus = 'connecting' | 'open' | 'reconnecting' | 'closed';
-
-/** Drives the 150ms green/red flash on the price header after a tick. */
-export type TickDirection = 'up' | 'down' | null;
-
-/** A single floating "micro-dopamine" particle rendered over the order panel. */
 export interface DopamineEvent {
   id: string;
-  /** Signed KRW amount to render, e.g. +500000 or -300000. */
-  amount: number;
-  /** Controls color/copy: profit & loss are PnL-driven, long/short are entry fills. */
   kind: 'profit' | 'loss' | 'long' | 'short';
+  amount: number;
   label: string;
-  createdAt: number;
 }
