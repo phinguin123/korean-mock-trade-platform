@@ -27,6 +27,10 @@ src/
 - Node.js **>= 18** (Node 20+ recommended; developed/tested against Node 24 LTS)
 - npm
 
+Optional, for containerized runs:
+
+- [Docker](https://docs.docker.com/get-docker/) and [Docker Compose](https://docs.docker.com/compose/) (v2+)
+
 ## Setup
 
 ```bash
@@ -36,10 +40,12 @@ cp .env.example .env
 
 Edit `.env` as needed (see [Configuration](#configuration) below). The defaults run entirely offline against the mock simulator — no external credentials required.
 
-## Running
+## Local development
+
+For day-to-day work, run the server natively on your machine — no Docker required.
 
 ```bash
-# Development (hot reload via ts-node-dev), mock market data (default)
+# Hot reload via ts-node-dev, mock market data (default)
 npm run dev
 
 # Explicitly force the mock simulator
@@ -48,15 +54,38 @@ npm run start:mock
 # Run against live Kiwoom REST/WebSocket feed (requires KIWOOM_APP_KEY/SECRET in .env)
 npm run start:kiwoom
 
-# Production: compile then run plain Node
-npm run build
-npm start
-
 # Type-check only, no emit
 npm run typecheck
 ```
 
-The server listens on `PORT` (default **8080**) for both the HTTP health-check/REST endpoints and the WebSocket upgrade — they share a single `http.Server` instance.
+The server listens on `PORT` (default **8080**) for both HTTP and WebSocket — connect at `http://localhost:8080` and `ws://localhost:8080`.
+
+To run a production-style build locally (compile TypeScript, then plain Node):
+
+```bash
+npm run build
+npm start
+```
+
+## Running with Docker Compose
+
+Docker Compose is optional — use it when you want a containerized production image or to mirror a deployed environment. It is not required for local development; use `npm run dev` above instead.
+
+```bash
+# Production image: compile TypeScript, run compiled Node output
+docker compose up --build
+
+# Detached
+docker compose up --build -d
+
+# Containerized dev (hot reload with src/ mounted) — alternative to npm run dev
+docker compose --profile dev up --build server-dev
+
+# Stop and remove containers
+docker compose down
+```
+
+To use the live Kiwoom feed instead of the mock simulator, set `MARKET_DATA_SOURCE=kiwoom` and your `KIWOOM_APP_KEY` / `KIWOOM_APP_SECRET` in `.env`, then restart the stack (or re-run `npm run dev` locally).
 
 ## HTTP Endpoints
 
