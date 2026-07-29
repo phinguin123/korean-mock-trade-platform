@@ -1,0 +1,18 @@
+# Dependencies (Docker will install these inside the container)
+node_modules/
+
+# Compiled TypeScript output
+dist/
+build/
+
+# Environment variables & secrets (NEVER COMMIT THESE)
+.env
+*.env.local
+
+# Logs & temp files
+*.log
+npm-debug.log*
+
+# OS clutter
+.DS_Store
+Thumbs.db
