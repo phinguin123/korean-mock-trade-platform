@@ -1,12 +1,12 @@
 services:
-  server:
+  backend:
     build:
-      context: .
+      context: ./backend
       target: production
     ports:
       - "${PORT:-8080}:8080"
     env_file:
-      - .env
+      - ./backend/.env
     environment:
       HOST: 0.0.0.0
     restart: unless-stopped
@@ -23,17 +23,17 @@ services:
       retries: 3
       start_period: 10s
 
-  server-dev:
+  backend-dev:
     profiles: [dev]
     build:
-      context: .
+      context: ./backend
       target: development
     ports:
       - "${PORT:-8080}:8080"
     env_file:
-      - .env
+      - ./backend/.env
     environment:
       HOST: 0.0.0.0
     volumes:
-      - ./src:/app/src
+      - ./backend/src:/app/src
     command: npm run dev

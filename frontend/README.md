@@ -22,13 +22,21 @@ src/
 ## Requirements
 
 - Node.js **>= 18**
-- The Step 1 backend running locally at `ws://localhost:8080` (see the repo root `README.md`)
+- The backend running locally at `ws://localhost:8080` (see [backend/README.md](../backend/README.md))
 
 ## Setup
 
 ```bash
+cd frontend
 npm install
-cp .env.local.example .env.local
+```
+
+Create `.env.local` if you need to override defaults:
+
+```bash
+# optional — defaults shown
+echo 'NEXT_PUBLIC_WS_URL=ws://localhost:8080' > .env.local
+echo 'NEXT_PUBLIC_DEFAULT_SYMBOL=005930' >> .env.local
 ```
 
 `.env.local` controls which backend/symbol the terminal connects to:
@@ -41,10 +49,12 @@ cp .env.local.example .env.local
 ## Running
 
 ```bash
-# from the repo root, in one terminal: start the backend
+# Terminal 1 — backend
+cd backend
 npm run dev
 
-# from frontend/, in another terminal: start the UI
+# Terminal 2 — frontend
+cd frontend
 npm run dev
 ```
 

@@ -1,12 +1,18 @@
-# Dependencies (Docker will install these inside the container)
+# Dependencies
 node_modules/
+backend/node_modules/
+frontend/node_modules/
 
-# Compiled TypeScript output
-dist/
+# Build output
+backend/dist/
+frontend/.next/
+frontend/out/
 build/
 
 # Environment variables & secrets (NEVER COMMIT THESE)
 .env
+backend/.env
+frontend/.env.local
 *.env.local
 
 # Logs & temp files
